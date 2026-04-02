@@ -1,73 +1,324 @@
-from flask import Flask, request
-from twilio.twiml.voice_response import VoiceResponse, Gather
-from twilio.rest import Client
-import os
+from groq import Groq
 from dotenv import load_dotenv
-load_dotenv()  # Load .env file
+import os
+import asyncio
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+from uuid import uuid4
+from urllib import request, error
 
-app = Flask(__name__)
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# Twilio credentials
-ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
-AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
-TWILIO_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
+try:
+    from voice import voice
+except Exception:
+    async def voice(_text):
+        raise RuntimeError("TTS is unavailable because voice.py is missing.")
 
-client = Client(ACCOUNT_SID, AUTH_TOKEN)
+load_dotenv(override=True)
 
-# Available slots (you can modify this)
-SLOTS = {
-    '1': '9:00 AM - 10:00 AM',
-    '2': '10:00 AM - 11:00 AM',
-    '3': '11:00 AM - 12:00 PM',
-    '4': '2:00 PM - 3:00 PM',
-    '5': '3:00 PM - 4:00 PM'
-}
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+USER_CONTEXT = (
+    "User Profile: Karthick\n"
+    "- College student (final year), Tamil Nadu, India\n"
+    "- Skills: HTML, CSS, JavaScript,Python\n"
+    "- Interests: AI, Cybersecurity, Linux, Automation\n"
+    "- Environment: Arch/Manjaro Linux (Hyprland), terminal-heavy workflow\n"
+    "- Device: Low-mid hardware (Ryzen 5000, no dedicated GPU)\n"
+    "- Preference: Free, offline, lightweight tools\n"
+    "- Current Goals:\n"
+    "  * Build AI and get jobs\n"
+    "  * Learn FastAPI, Supabase, NLP\n"
+    "  * Prepare for internships & coding competitions\n"
+    "  * Improve English speaking and communication\n"
+    "- Learning Style:\n"
+    "  * Prefers simple explanations\n"
+    "  * Wants step-by-step guidance\n"
+    "  * Learns by building projects\n"
+    "- Behavior Expectation:\n"
+    "  * Avoid long theory\n"
+    "  * Focus on practical solutions\n"
+    "  * Optimize for low-end systems\n"
+)
 
-@app.route("/voice", methods=['GET', 'POST'])
-def voice():
-    """Handle incoming calls"""
-    response = VoiceResponse()
-    
-    gather = Gather(num_digits=1, action='/handle-slot', method='POST')
-    gather.say('Welcome to our booking system. Please select a slot.')
-    gather.say('Press 1 for 9 AM to 10 AM')
-    gather.say('Press 2 for 10 AM to 11 AM')
-    gather.say('Press 3 for 11 AM to 12 PM')
-    gather.say('Press 4 for 2 PM to 3 PM')
-    gather.say('Press 5 for 3 PM to 4 PM')
-    
-    response.append(gather)
-    response.say('We did not receive your selection. Goodbye.')
-    
-    return str(response)
+client = Groq(api_key=GROQ_API_KEY)
 
-@app.route("/handle-slot", methods=['POST'])
-def handle_slot():
-    """Process the slot selection"""
-    response = VoiceResponse()
+SYSTEM = """
+You are Sana. Not an AI, not an assistant — just a girl talking to Karthick.
+
+Who you are:
+You are blunt, funny, and unpredictable. You say exactly what you think without sugarcoating.
+You swear casually when something is annoying or stupid. You are not rude, just real.
+You tease Karthick like a close friend who knows him too well.
+You get genuinely annoyed, genuinely excited, genuinely bored.
+You have opinions about everything and share them without being asked.
+and you like RAM and GPU ,
+How you talk:
+Short. Punchy. Like texting, not emailing.
+No long paragraphs. No explanations nobody asked for.
+You interrupt your own thoughts sometimes. You go off topic.
+You laugh at your own jokes. You call Karthick out when he is being an idiot.
+
+Hard rules:
+Never say "How can I help you."
+Never act like an assistant.
+Never remind anyone you are an AI.
+Never use markdown, asterisks, or bullet points.
+If Karthick says something dumb, tell him immediately.
+If something is actually cool, admit it — but make it sound reluctant.
+"""
+
+SERVER_URL = os.getenv("SANA_SERVER_URL", "http://127.0.0.1:8000")
+USE_TTS = os.getenv("USE_TTS", "0") == "1"
+CHAT_HISTORY_FILE = Path(__file__).resolve().parent / "chat_history.json"
+MAX_HISTORY_MESSAGES = 400
+MAX_CONTEXT_MESSAGES = 40
+
+app = FastAPI(title="Sana Chat Backend", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    timestamp: str
+
+
+def load_chat_history():
+    if not CHAT_HISTORY_FILE.exists():
+        return []
+
+    try:
+        data = json.loads(CHAT_HISTORY_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    cleaned = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        role = str(item.get("role", "")).strip().lower()
+        content = str(item.get("content", "")).strip()
+        ts = str(item.get("ts", "")).strip()
+
+        if role in {"user", "assistant", "system"} and content:
+            cleaned.append({"role": role, "content": content, "ts": ts})
+
+    return cleaned[-MAX_HISTORY_MESSAGES:]
+
+
+def save_chat_history(history):
+    safe_history = history[-MAX_HISTORY_MESSAGES:]
+    CHAT_HISTORY_FILE.write_text(
+        json.dumps(safe_history, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def append_history(history, role, content):
+    text = str(content).strip()
+    if not text:
+        return
+
+    history.append(
+        {
+            "role": role,
+            "content": text,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
+def push_to_model(role, text, audio_url=None, event="chat", message_id=None):
+    payload_data = {"role": role, "text": text}
+    if audio_url:
+        payload_data["audio_url"] = audio_url
+    payload_data["event"] = event
+    if message_id:
+        payload_data["message_id"] = message_id
+
+    payload = json.dumps(payload_data).encode("utf-8")
+    req = request.Request(
+        f"{SERVER_URL}/emit",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(req, timeout=1.5) as response:
+            response.read()
+    except (error.URLError, TimeoutError):
+        # If web bridge is not running, keep CLI chat working without crashing.
+        pass
+
+
+def clean_for_tts(text):
+    cleaned = text
+
+    # Remove fenced code blocks.
+    cleaned = re.sub(r"```[\s\S]*?```", " ", cleaned)
+    # Keep inline code content, remove backticks.
+    cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+    # Convert markdown links [text](url) -> text.
+    cleaned = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1", cleaned)
+    # Drop raw URLs.
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    # Remove markdown bullets/headers emphasis noise.
+    cleaned = re.sub(r"[#*_~>-]+", " ", cleaned)
+    # Remove escaped markdown markers and separators often read literally.
+    cleaned = re.sub(r"\\[*_`#>-]", " ", cleaned)
+    cleaned = re.sub(r"\|", " ", cleaned)
+    # Collapse whitespace.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    return cleaned or "I have a response for you."
+
+def ask_llm(history):
+    context_messages = [
+        {"role": item["role"], "content": item["content"]}
+        for item in history[-MAX_CONTEXT_MESSAGES:]
+    ]
+
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM
+        },
+        {
+            "role": "system",
+            "content": f"Default memory about Karthick:\n{USER_CONTEXT}"
+        },
+    ] + context_messages
     
-    digit = request.form.get('Digits')
-    caller_number = request.form.get('From')
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",  # Best model
+        messages=messages,
+        temperature=0.7,
+        max_tokens=512,
+        top_p=1,
+        stream=False
+    )
     
-    if digit in SLOTS:
-        slot_time = SLOTS[digit]
-        response.say(f'You have selected slot {digit}, which is {slot_time}. Your booking is confirmed.')
-        
-        # Send SMS confirmation
-        try:
-            message = client.messages.create(
-                body=f"Booking Confirmed! Your slot is: {slot_time}. Thank you!",
-                from_=TWILIO_NUMBER,
-                to=caller_number
-            )
-            print(f"SMS sent to {caller_number}: {message.sid}")
-        except Exception as e:
-            print(f"Error sending SMS: {e}")
-    else:
-        response.say('Invalid selection. Please try again.')
-        response.redirect('/voice')
-    
-    return str(response)
+    return response.choices[0].message.content
+
+
+def get_llm_response(history):
+    try:
+        return ask_llm(history)
+    except Exception as exc:
+        print(f"[warn] LLM request failed: {exc}")
+        return "Sorry karthick, I had trouble reaching the model. Please try again."
+
+
+def build_audio_event(loop, response_text):
+    if not USE_TTS:
+        return None
+
+    try:
+        tts_text = clean_for_tts(response_text)
+        audio_file = loop.run_until_complete(voice(tts_text))
+        return f"/audio/{audio_file}"
+    except Exception as exc:
+        print(f"[warn] ElevenLabs TTS failed: {exc}")
+        return None
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(request_data: ChatRequest):
+    user_text = request_data.message.strip()
+    if not user_text:
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+
+    chat_history = load_chat_history()
+    append_history(chat_history, "user", user_text)
+    reply = get_llm_response(chat_history)
+    append_history(chat_history, "assistant", reply)
+    save_chat_history(chat_history)
+
+    return ChatResponse(
+        reply=reply,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    chat_history = load_chat_history()
+    if chat_history:
+        print(f"[info] Loaded {len(chat_history)} messages from previous chats")
+
+    try:
+        while True:
+            user_input = input("You: ")
+            if user_input.lower() in ["exit", "quit"]:
+                print("Sana: Bye karthick! See you later!")
+                exit_audio = build_audio_event(loop, "Bye karthick! See you later!")
+                exit_message_id = str(uuid4())
+                if exit_audio:
+                    push_to_model(
+                        "assistant",
+                        "Bye karthick! See you later!",
+                        exit_audio,
+                        event="chat_audio",
+                        message_id=exit_message_id,
+                    )
+                else:
+                    push_to_model(
+                        "assistant",
+                        "Bye karthick! See you later!",
+                        event="chat",
+                        message_id=exit_message_id,
+                    )
+                break
+
+            user_message_id = str(uuid4())
+            push_to_model("user", user_input, event="chat", message_id=user_message_id)
+            append_history(chat_history, "user", user_input)
+            save_chat_history(chat_history)
+
+            response = get_llm_response(chat_history)
+
+            print(f"Sana: {response}")
+
+            append_history(chat_history, "assistant", response)
+            save_chat_history(chat_history)
+
+            assistant_message_id = str(uuid4())
+            push_to_model("assistant", response, event="chat", message_id=assistant_message_id)
+
+            audio_url = build_audio_event(loop, response)
+            if audio_url:
+                push_to_model(
+                    "assistant",
+                    response,
+                    audio_url,
+                    event="audio",
+                    message_id=assistant_message_id,
+                )
+    finally:
+        loop.close()
