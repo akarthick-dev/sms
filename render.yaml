@@ -1,6 +1,0 @@
-services:
-  - type: web
-    name: twilio-booking
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
