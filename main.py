@@ -16,10 +16,21 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 try:
-    from voice import voice
+    # Works for `python -m uvicorn backend.main:app`
+    from .voice import voice
+    _voice_import_error = None
 except Exception:
-    async def voice(_text):
-        raise RuntimeError("TTS is unavailable because voice.py is missing.")
+    try:
+        # Fallback for direct script execution from backend directory.
+        from voice import voice
+        _voice_import_error = None
+    except Exception as exc:
+        _voice_import_error = exc
+
+        async def voice(_text):
+            raise RuntimeError(
+                f"TTS is unavailable because voice.py failed to load: {_voice_import_error}"
+            )
 
 load_dotenv(override=True)
 BASE_DIR = Path(__file__).resolve().parent
