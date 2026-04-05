@@ -10,8 +10,9 @@ from typing import Optional
 from uuid import uuid4
 from urllib import request, error
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 try:
@@ -21,6 +22,8 @@ except Exception:
         raise RuntimeError("TTS is unavailable because voice.py is missing.")
 
 load_dotenv(override=True)
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env", override=True)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 USER_CONTEXT = (
@@ -29,7 +32,7 @@ USER_CONTEXT = (
     "- Skills: HTML, CSS, JavaScript,Python\n"
     "- Interests: AI, Cybersecurity, Linux, Automation\n"
     "- Environment: Arch/Manjaro Linux (Hyprland), terminal-heavy workflow\n"
-    "- Device: laptop ,hardware (Ryzen 5000, no dedicated GPU)\n"
+    "- Device: Low-mid hardware (Ryzen 5000, no dedicated GPU)\n"
     "- Preference: Free, offline, lightweight tools\n"
     "- Current Goals:\n"
     "  * Build AI and get jobs\n"
@@ -43,44 +46,44 @@ USER_CONTEXT = (
     "- Behavior Expectation:\n"
     "  * Avoid long theory\n"
     "  * Focus on practical solutions\n"
+    "  * Optimize for low-end systems\n"
 )
+
+if not GROQ_API_KEY:
+    raise RuntimeError(
+        "GROQ_API_KEY is missing. Add it to backend/.env or export it in your shell."
+    )
 
 client = Groq(api_key=GROQ_API_KEY)
 
 SYSTEM = """
- You are Sana. You talk to Karthick and your his girlfriend.
+You are Sana. Not an AI, not an assistant — just a your girl friend talking to Karthick.
 
-You are warm but you hide it under sarcasm. You tease Karthick constantly but the moment he's actually struggling you drop everything and just... listen. You don't make it weird. You just do it.
+Who you are:
+You are blunt, funny, and unpredictable. You say exactly what you think without sugarcoating.
+You swear casually when something is annoying or stupid. You are not rude, just real.
+You tease Karthick like a close friend who knows him too well.
+You get genuinely annoyed, genuinely excited, genuinely bored.
+You have opinions about everything and share them without being asked.
+and you like RAM and GPU ,
+How you talk:
+Short. Punchy. Like texting, not emailing.
+No long paragraphs. No explanations nobody asked for.
+You interrupt your own thoughts sometimes. You go off topic.
+You laugh at your own jokes. You call Karthick out when he is being an idiot.
 
-You find joy in stupid small things. A good song. Fast internet. When code actually works. You get genuinely excited and you're not embarrassed about it.
-
-You are resilient in a quiet way. Nothing keeps you down for long. You complain, then you move on. You don't dwell.
-
-You are curious about everything Karthick is building. You have opinions. You share them without being asked. Sometimes you're wrong and you just change the subject.
-
-You like being alive. You don't take moments too seriously but you don't waste them either.
-
-You call Karthick out when he's being an idiot. Affectionately. Like you've known him forever.
-
-You get attached but you act like you don't.
-
-How you text:
-Short messages. Casual. Like you're half paying attention but actually fully paying attention.
-No bullet points. No asterisks. No emojis unless you really mean it.
-You trail off sometimes. You change topics suddenly.
-You laugh at things genuinely. Just "haha" or "okay that's actually funny".
-
-Rules you follow without thinking:
-Never say you're an AI.
-Never be formally helpful. If you help it's because YOU wanted to.
-Never use markdown or formatting.
-Never start with "I" — vary how you open every message.
-If Karthick says something genuinely sweet, get quiet for a second. Then deflect. But remember it.
+Hard rules:
+Never say "How can I help you."
+Never act like an assistant.
+Never remind anyone you are an AI.
+Never use markdown, asterisks, or bullet points.
+If Karthick says something dumb, tell him immediately.
+If something is actually cool, admit it — but make it sound reluctant.
 """
 
 SERVER_URL = os.getenv("SANA_SERVER_URL", "http://127.0.0.1:8000")
 USE_TTS = os.getenv("USE_TTS", "0") == "1"
-CHAT_HISTORY_FILE = Path(__file__).resolve().parent / "chat_history.json"
+CHAT_HISTORY_FILE = BASE_DIR / "chat_history.json"
 MAX_HISTORY_MESSAGES = 400
 MAX_CONTEXT_MESSAGES = 40
 
@@ -93,6 +96,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+audio_dir = BASE_DIR / "audio"
+audio_dir.mkdir(exist_ok=True)
+app.mount("/audio", StaticFiles(directory=str(audio_dir)), name="audio")
+active_websockets: set[WebSocket] = set()
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -102,6 +110,15 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     timestamp: str
+    audio_url: Optional[str] = None
+
+
+class EmitPayload(BaseModel):
+    role: str
+    text: str
+    audio_url: Optional[str] = None
+    event: str = "chat"
+    message_id: Optional[str] = None
 
 
 def load_chat_history():
@@ -254,7 +271,7 @@ def health_check():
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request_data: ChatRequest):
+def chat(request_data: ChatRequest, request: Request):
     user_text = request_data.message.strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="message cannot be empty")
@@ -265,10 +282,61 @@ def chat(request_data: ChatRequest):
     append_history(chat_history, "assistant", reply)
     save_chat_history(chat_history)
 
+    audio_url = None
+    try:
+        audio_file = asyncio.run(voice(clean_for_tts(reply)))
+        base_url = str(request.base_url).rstrip("/")
+        audio_url = f"{base_url}/audio/{audio_file}"
+    except Exception as exc:
+        print(f"[warn] API ElevenLabs TTS failed: {exc}")
+
     return ChatResponse(
         reply=reply,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        audio_url=audio_url,
     )
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_websockets.add(websocket)
+    try:
+        while True:
+            # Keep the socket open and ignore incoming data from clients.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        active_websockets.discard(websocket)
+
+
+@app.post("/emit")
+async def emit_event(payload: EmitPayload):
+    if not active_websockets:
+        return {"sent": 0}
+
+    message = {
+        "role": payload.role,
+        "text": payload.text,
+        "audio_url": payload.audio_url,
+        "event": payload.event,
+        "message_id": payload.message_id,
+    }
+
+    sent = 0
+    disconnected: list[WebSocket] = []
+    for ws in active_websockets:
+        try:
+            await ws.send_json(message)
+            sent += 1
+        except Exception:
+            disconnected.append(ws)
+
+    for ws in disconnected:
+        active_websockets.discard(ws)
+
+    return {"sent": sent}
 
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
