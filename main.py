@@ -235,16 +235,12 @@ def ask_llm(history):
     messages = [
         {
             "role": "system",
-            "content": SYSTEM
-        },
-        {
-            "role": "system",
-            "content": f"Default memory about Karthick:\n{USER_CONTEXT}"
+            "content": f"{SYSTEM}\n\nIMPORTANT: If the user asks you to open an app (e.g., 'open youtube' or 'launch notes'), respond EXACTLY with this JSON string and NOTHING ELSE:\n{{\"intent\": \"open_app\", \"target\": \"<app_name>\", \"reply\": \"Opening <app_name>\"}}\n\nDefault memory about Karthick:\n{USER_CONTEXT}"
         },
     ] + context_messages
     
     response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",  # Best model
+        model="llama-3.3-70b-versatile",  # Best model
         messages=messages,
         temperature=0.7,
         max_tokens=512,
